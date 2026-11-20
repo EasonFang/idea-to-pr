@@ -47,14 +47,55 @@ worker 拿到的永远是纯文本。不做两条并行流水线。
 - **机器人被屏蔽**：贴纸/频道帖/编辑/空消息 ack 后静默忽略，不发任何回复。
 - **伪造请求**：配了 secret 却没签名头 → 直接 401（fail closed），常数时间比较防时序侧信道。
 
+## 完成流程（Devin 结束时到底发生什么）
+
+这是从"Devin 干完活"到"Telegram 里一键决策"的完整链路，全部为事件驱动，不靠轮询：
+
+```
+Devin session 状态变化
+        │  POST /devin-webhook  (X-Devin-Webhook-Secret 校验，fail closed)
+        ▼
+normalise_event()          统一 v1/v2/v3 多种 payload 形状
+        │
+        ▼
+SessionRegistry            用 session_id 反查发起它的 chat_id（webhook 本身不带 chat）
+   + seen_events 去重        Devin at-least-once 投递不会造成重复消息
+        │
+        ▼
+sendMessage + inline_keyboard   Telegram 直接弹出三个按钮：
+        │                       ✅ Approve   🔁 Re-prompt   ⏹ Close
+        ▼
+用户点按钮 -> callback_query -> POST /webhook
+        │   answerCallbackQuery 立即停掉转圈；动作入队
+        ▼
+worker.handle(callback job) -> handle_callback()
+        ├─ approve  -> on_approve 钩子（可合并 PR）+ 确认消息
+        ├─ reprompt -> Devin POST /sessions/{id}/message 追加指令
+        └─ close    -> Devin cancel_session + 注销映射
+```
+
+关键实现点：
+
+- **webhook 永远 200**：Telegram/Devin 发消息失败只记日志，绝不返回 5xx，否则上游重试 → 重复通知。
+- **callback_data 就是控制通道**：`approve:<sid>` / `reprompt:<sid>` / `close:<sid>`， Telegram 按钮按下后原样回到 `/webhook`，无需维护额外会话状态。
+- **归属校验**：按钮只能控制 registry 中属于当前 chat 的 session，别人无法取消你的任务。
+- **轮询仅作兜底**：worker 里的状态轮询保留，但完成后的交互走 webhook 事件；Late webhook 仍能通过 registry 找到 chat。
+
+对应文件：`devin_events.py`、`sessions.py`、`completion.py`、`app.py`（`/devin-webhook`）、
+`extract.py`（callback_query）、`worker.py`（callback job）、`test_completion.py`。
+
 ## 运行
 
 ```bash
 pip install -r requirements.txt
 export WEBHOOK_SECRET="your-secret"
+export DEVIN_WEBHOOK_SECRET="your-devin-secret"
 export TELEGRAM_BOT_TOKEN="..."
 uvicorn app:app --reload
 ```
+
+Devin 控制台中把 session 事件 webhook 指向 `https://<host>/devin-webhook`，
+secret 与 `DEVIN_WEBHOOK_SECRET` 一致。
 
 测试（CI 里跑，不依赖网络与真实 token）：
 
@@ -70,7 +111,9 @@ pytest -q
 | M1 | ingress（webhook + 校验 + 队列 + 测试） | ✅ |
 | M2 | voice.py faster-whisper | ✅ |
 | M3 | Issue 开单 + 去重 | ✅ |
-| M4 | Devin 接入 + 事件回推 | ✅（骨架） |
+| M4 | Devin 接入 + 事件回推 | ✅ |
 | M5 | 重试上限 + 死循环 + /stop | ✅ |
+| M6 | 完成流程：Devin webhook + Telegram 三按钮 + 去重 | ✅ |
 
-> M4 的 Devin 轮询为骨架实现：真实部署应改为消费 Devin 的 webhook 事件流。
+测试：43 passed。覆盖签名 401/200、不可处理更新零回复、通知失败仍 200、
+Issue 幂等、重试/死循环、Devin 事件归一化、事件去重、callback 提取、三个按钮动作与归属校验。
