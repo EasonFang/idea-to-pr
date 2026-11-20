@@ -17,6 +17,25 @@ def extract_message(update: dict[str, Any]) -> IncomingMessage | None:
     if not isinstance(update, dict):
         return None
 
+    # Inline-keyboard button press. Telegram sends these as callback_query,
+    # NOT as message -- a bot that only reads .message silently drops them.
+    cb = update.get("callback_query")
+    if isinstance(cb, dict):
+        cb_msg = cb.get("message") or {}
+        chat_id = (cb_msg.get("chat") or {}).get("id")
+        if chat_id is None:
+            chat_id = (cb.get("from") or {}).get("id")
+        if chat_id is None:
+            return None
+        return IncomingMessage(
+            kind=MessageKind.CALLBACK,
+            chat_id=chat_id,
+            text=str(cb.get("data") or "").strip(),
+            callback_id=str(cb.get("id") or ""),
+            callback_data=str(cb.get("data") or "").strip(),
+            raw=update,
+        )
+
     # Only plain private/group messages are handled.
     if "edited_message" in update or "channel_post" in update:
         return None
