@@ -90,6 +90,15 @@ class DevinClient:
             url=data.get("url", ""),
         )
 
+    def send_message(self, session_id: str, message: str) -> bool:
+        """Send a follow-up instruction into a running session (re-prompt)."""
+        self._request(
+            "POST",
+            f"/sessions/{session_id}/message",
+            json={"message": message},
+        )
+        return True
+
     def cancel_session(self, session_id: str) -> bool:
         try:
             self._request("POST", f"/sessions/{session_id}/cancel")
