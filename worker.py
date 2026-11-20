@@ -14,9 +14,11 @@ import logging
 from dataclasses import dataclass
 
 from devin import DevinClient, RetryGuard
+from completion import handle_callback
 from github_issues import GitHubIssues
-from models import Job, Spec
+from models import Job, MessageKind, Spec
 from notifier import Notifier
+from sessions import SessionRegistry
 from spec import parse_idea
 
 logger = logging.getLogger(__name__)
@@ -41,14 +43,31 @@ class WorkerDeps:
     transcriber=None
     spec_parser=None
     max_retries: int = 3
+    sessions: SessionRegistry | None = None
+    on_approve=None  # optional callable(session_id) -> None
 
 
 class Worker:
     def __init__(self, deps: WorkerDeps):
         self.deps = deps
-        self.active_sessions: dict[int, str] = {}  # chat_id -> devin session id
+        # Prefer a shared registry (wired to the /devin-webhook endpoint) so
+        # event relay and button actions see the same session -> chat mapping.
+        self.sessions = deps.sessions or SessionRegistry()
+        self.active_sessions = self.sessions.by_chat  # view: chat_id -> session_id
 
     def handle(self, job: Job) -> None:
+        # Inline button press: no ack, no spec parsing -- straight to the action.
+        if job.source == "callback":
+            handle_callback(
+                job.text,
+                job.chat_id,
+                self.sessions,
+                self.deps.notifier,
+                self.deps.devin,
+                on_approve=self.deps.on_approve,
+            )
+            return
+
         text = job.text
         if job.source == "voice" and self.deps.transcriber is not None:
             try:
@@ -94,16 +113,29 @@ class Worker:
         guard = RetryGuard(max_retries=self.deps.max_retries)
         try:
             session = self.deps.devin.create_session(prompt)
-            self.active_sessions[chat_id] = session.session_id
+            self.sessions.register(session.session_id, chat_id)
             self.deps.notifier.progress(chat_id, f"Devin 已启动：{session.session_id}")
 
-            # Poll with guards (simplified loop; real impl uses webhooks/events).
+            # Fallback status polling. The primary completion signal is the
+            # Devin event webhook (/devin-webhook) -> relay_event -> buttons.
+            # We keep the session registered so a late webhook can still find
+            # this chat; only the Close button /stop unregisters it.
             for _ in range(self.deps.max_retries):
                 current = self.deps.devin.get_session(session.session_id)
                 self.deps.notifier.progress(chat_id, f"状态：{current.status}")
                 if current.status in ("completed", "finished", "draft_pr_opened"):
-                    self.deps.notifier.send_message(chat_id, "Devin 完成，draft PR 已就绪。")
-                    self.active_sessions.pop(chat_id, None)
+                    pr_url = getattr(current, "url", "") or ""
+                    text = f"Devin 完成，draft PR 已就绪。\nSession: {pr_url}\n请选择操作："
+                    sid = session.session_id
+                    self.deps.notifier.send_with_actions(
+                        chat_id,
+                        text,
+                        [
+                            ("✅ Approve", f"approve:{sid}"),
+                            ("🔁 Re-prompt", f"reprompt:{sid}"),
+                            ("⏹ Close", f"close:{sid}"),
+                        ],
+                    )
                     return
                 if current.status in ("error", "blocked", "failed"):
                     decision = guard.record_failure("scaffold", current.status)
@@ -115,11 +147,11 @@ class Worker:
                         return
         except Exception as exc:  # noqa: BLE001
             self.deps.notifier.send_message(chat_id, f"Devin 调用失败：{exc}")
-        finally:
-            self.active_sessions.pop(chat_id, None)
 
     def stop(self, chat_id: int) -> None:
-        sid = self.active_sessions.pop(chat_id, None)
+        sid = self.sessions.by_chat.pop(chat_id, None)
+        if sid:
+            self.sessions.by_session.pop(sid, None)
         if sid and self.deps.devin is not None:
             self.deps.devin.cancel_session(sid)
             self.deps.notifier.send_message(chat_id, "已取消当前 Devin session。")
