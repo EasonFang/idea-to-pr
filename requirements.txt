@@ -1,0 +1,10 @@
+fastapi>=0.110
+uvicorn[standard]>=0.30
+httpx>=0.27
+pytest>=8.0
+sniffio>=1.3
+
+# Voice (P1) - heavy, installed only when needed
+# faster-whisper>=1.0
+
+# Structured spec parsing (P1) - use any cheap/fast model SDK you prefer
