@@ -16,6 +16,7 @@ class MessageKind(str, Enum):
     TEXT = "text"
     VOICE = "voice"
     COMMAND = "command"
+    CALLBACK = "callback"  # inline-keyboard button press
     UNHANDLED = "unhandled"
 
 
@@ -28,10 +29,17 @@ class IncomingMessage:
     text: str = ""
     voice_file_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+    callback_id: str = ""  # Telegram callback_query.id, needs answerCallbackQuery
+    callback_data: str = ""  # e.g. "approve:sess-123"
 
     @property
     def is_actionable(self) -> bool:
-        return self.kind in (MessageKind.TEXT, MessageKind.VOICE, MessageKind.COMMAND)
+        return self.kind in (
+            MessageKind.TEXT,
+            MessageKind.VOICE,
+            MessageKind.COMMAND,
+            MessageKind.CALLBACK,
+        )
 
 
 @dataclass
