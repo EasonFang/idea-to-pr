@@ -1,2 +1,0 @@
-probe content line 1
-probe content line 2
